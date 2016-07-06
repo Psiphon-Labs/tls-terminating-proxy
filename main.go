@@ -9,21 +9,33 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 )
 
-var localAddress, backendAddress string
-var logPath, caPath, certificatePath, keyPath string
+type stringListFlag []string
 
-func init() {
+func (list *stringListFlag) String() string {
+	return strings.Join(*list, ", ")
+}
+
+func (list *stringListFlag) Set(flagValue string) error {
+	*list = append(*list, flagValue)
+	return nil
+}
+
+var localAddress, backendAddress string
+var caPath, certificatePath, keyPath string
+var logPath string
+var allowableCns stringListFlag
+
+func main() {
 	flag.StringVar(&logPath, "log", "", "local address")
 	flag.StringVar(&caPath, "ca", "ssl/ca.pem", "SSL CA certificate path")
 	flag.StringVar(&certificatePath, "server-certificate", "ssl/cert.pem", "SSL server certificate path")
 	flag.StringVar(&keyPath, "server-key", "ssl/key.pem", "SSL server key path")
 	flag.StringVar(&localAddress, "local", ":44300", "local address")
 	flag.StringVar(&backendAddress, "backend", "localhost:9999", "backend address")
-}
-
-func main() {
+	flag.Var(&allowableCns, "cn", "whitelist of allowed CNs in the client certificate (this flag can be repeated to allow multiple CNs)")
 	flag.Parse()
 
 	if logPath != "" {
@@ -48,7 +60,13 @@ func main() {
 	}
 	caPool.AppendCertsFromPEM(serverCert)
 
-	tlsConfig := tls.Config{RootCAs: caPool, ClientCAs: caPool, ClientAuth: tls.RequireAndVerifyClientCert, Certificates: []tls.Certificate{cert}, InsecureSkipVerify: true}
+	tlsConfig := tls.Config{
+		RootCAs:            caPool,
+		ClientCAs:          caPool,
+		ClientAuth:         tls.RequireAndVerifyClientCert,
+		Certificates:       []tls.Certificate{cert},
+		InsecureSkipVerify: false,
+	}
 
 	listener, err := tls.Listen("tcp", localAddress, &tlsConfig)
 	if err != nil {
@@ -76,6 +94,21 @@ func handleConnection(client net.Conn) {
 			log.Printf("Error during handshake: %s\n", err)
 			client.Close()
 			return
+		}
+
+		clientCn := tlsConnection.ConnectionState().PeerCertificates[0].Subject.CommonName
+		if len(allowableCns) == 0 {
+			log.Println("No allowable CNs passed, allowing any")
+		} else {
+			for _, cnCandidate := range allowableCns {
+				if clientCn == cnCandidate {
+					break
+				} else {
+					log.Printf("Client certificate for: %s was not in the whitelist, not relaying\n", clientCn)
+					client.Close()
+					return
+				}
+			}
 		}
 
 		backend, err := net.Dial("tcp", backendAddress)
